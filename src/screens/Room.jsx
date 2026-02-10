@@ -11,75 +11,70 @@ export default function Room() {
 
   const socket = useSocket();
 
-  // useEffect For Video Stream
-  useEffect(() => {
-    if (myVideoRef.current && myStream) {
-      myVideoRef.current.srcObject = myStream;
-    }
-  }, [myStream]);
-
-  // Call User Handler
-  const handleCallUser = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-
-    setMyStream(stream);
-
+  // Helper: Adds tracks without duplicates
+  const addTracksToPeer = useCallback((stream) => {
     stream.getTracks().forEach((track) => {
-      peer.peer.addTrack(track, stream);
+      const senders = peer.peer.getSenders();
+      const alreadyExists = senders.find((s) => s.track === track);
+      if (!alreadyExists) {
+        peer.peer.addTrack(track, stream);
+      }
     });
+  }, []);
 
-    const offer = await peer.getOffer();
-    socket.emit("call:user", { to: socketId, offer });
-  }, [socket, socketId]);
-
-  // User Joined Handler
+  // Handler: User Joined
   const handleUserJoined = useCallback(({ email, id }) => {
     console.log("User joined:", { email, id });
     setSocketId(id);
   }, []);
 
-  // Incomming Call Handler
+  // Handler: Initiation of Call
+  const handleCallUser = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true,
+    });
+    setMyStream(stream);
+    addTracksToPeer(stream);
+
+    const offer = await peer.getOffer();
+    socket.emit("call:user", { to: socketId, offer });
+  }, [socket, socketId, addTracksToPeer]);
+
+  // Handler: Incoming Call
   const handleIncommingCall = useCallback(
     async ({ from, offer }) => {
+      setSocketId(from);
       const stream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true,
       });
+      setMyStream(stream);
+      addTracksToPeer(stream);
 
       const ans = await peer.getAnswer(offer);
       socket.emit("call:accepted", { to: from, ans });
-
-      setMyStream(stream);
     },
-    [socket],
+    [socket, addTracksToPeer],
   );
 
-  const sendStreams = useCallback(() => {
-    if (!myStream) return;
-
-    myStream.getTracks().forEach((track) => {
-      const alreadyExists = peer.peer
-        .getSenders()
-        .find((s) => s.track === track);
-      if (!alreadyExists) {
-        peer.peer.addTrack(track, myStream);
-      }
-    });
-  }, [myStream]);
-
-  // Call Accepted Handler
-  const handleCallAccepted = useCallback(
-    async ({ from, ans }) => {
+  // Handler: Call Accepted
+  const handleCallAccepted = useCallback(async ({ from, ans }) => {
+    // Only set description if we are expecting an answer
+    if (peer.peer.signalingState === "have-local-offer") {
       await peer.setLocalDescription(ans);
-      console.log("Call accepted by:", from);
+      console.log("Call accepted and connection stabilized");
+    }
+  }, []);
 
-      sendStreams();
-    },
-    [sendStreams],
-  );
+  // Negotiation Logic
+  const handleNegoNeeded = useCallback(async () => {
+    // Crucial fix: Only trigger negotiation if state is stable
+    if (peer.peer.signalingState !== "stable") return;
+
+    const offer = await peer.getOffer();
+    socket.emit("peer:nego:needed", { offer, to: socketId });
+  }, [socket, socketId]);
 
   const handleNegoNeededIncomming = useCallback(
     async ({ from, offer }) => {
@@ -90,10 +85,12 @@ export default function Room() {
   );
 
   const handleNegoDone = useCallback(async ({ ans }) => {
-    await peer.setLocalDescription(ans);
+    if (peer.peer.signalingState === "have-local-offer") {
+      await peer.setLocalDescription(ans);
+    }
   }, []);
 
-  // useEffect For Sockets
+  // Sockets Listeners
   useEffect(() => {
     socket.on("user:joined", handleUserJoined);
     socket.on("incomming:call", handleIncommingCall);
@@ -109,435 +106,182 @@ export default function Room() {
       socket.off("peer:nego:done", handleNegoDone);
     };
   }, [
+    socket,
     handleUserJoined,
     handleIncommingCall,
     handleCallAccepted,
     handleNegoNeededIncomming,
     handleNegoDone,
-    socket,
   ]);
 
-  // useEffect For Remote Stream
+  // Peer Listeners (Track and Negotiation)
   useEffect(() => {
     const handleTrack = (ev) => {
-      const [stream] = ev.streams;
-      setRemoteStream(stream);
+      setRemoteStream(ev.streams[0]);
     };
 
     peer.peer.addEventListener("track", handleTrack);
-
-    return () => {
-      peer.peer.removeEventListener("track", handleTrack);
-    };
-  }, []);
-
-  // useEffect For Remote Video
-  useEffect(() => {
-    if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
-    }
-  }, [remoteStream]);
-
-  // Negotiation Needed Handler
-  const handleNegoNeeded = useCallback(async () => {
-    const offer = await peer.getOffer();
-    socket.emit("peer:nego:needed", { offer, to: socketId });
-  }, [socket, socketId]);
-
-  // useEffect For Negotiation Needed
-  useEffect(() => {
     peer.peer.addEventListener("negotiationneeded", handleNegoNeeded);
 
     return () => {
+      peer.peer.removeEventListener("track", handleTrack);
       peer.peer.removeEventListener("negotiationneeded", handleNegoNeeded);
     };
-  }, [handleNegoNeeded, socket, socketId]);
+  }, [handleNegoNeeded]);
+
+  // Video Ref Updates
+  useEffect(() => {
+    if (myVideoRef.current && myStream) myVideoRef.current.srcObject = myStream;
+  }, [myStream]);
+
+  useEffect(() => {
+    if (remoteVideoRef.current && remoteStream)
+      remoteVideoRef.current.srcObject = remoteStream;
+  }, [remoteStream]);
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(135deg, #3c3c3c 0%, #2a2a2a 100%)",
-        fontFamily:
-          '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-        color: "#ffffff",
-        padding: "20px",
-      }}
-    >
-      {/* Header */}
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          padding: "20px 30px",
-          background: "rgba(0, 74, 119, 0.2)",
-          borderRadius: "16px",
-          marginBottom: "30px",
-          backdropFilter: "blur(10px)",
-          border: "1px solid rgba(0, 74, 119, 0.3)",
-        }}
-      >
-        <h1
-          style={{
-            margin: 0,
-            fontSize: "28px",
-            fontWeight: "600",
-            background: "linear-gradient(90deg, #ffffff 0%, #004a77 100%)",
-            WebkitBackgroundClip: "text",
-            WebkitTextFillColor: "transparent",
-          }}
-        ></h1>
-
-        <div style={{ display: "flex", gap: "12px" }}>
-          {socketId && (
-            <button
-              onClick={handleCallUser}
-              style={{
-                padding: "12px 28px",
-                background: "linear-gradient(135deg, #004a77 0%, #006ba8 100%)",
-                border: "none",
-                borderRadius: "10px",
-                color: "white",
-                fontSize: "15px",
-                fontWeight: "600",
-                cursor: "pointer",
-                transition: "all 0.3s ease",
-                boxShadow: "0 4px 15px rgba(0, 74, 119, 0.4)",
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-              }}
-              onMouseOver={(e) => {
-                e.currentTarget.style.transform = "translateY(-2px)";
-                e.currentTarget.style.boxShadow =
-                  "0 6px 20px rgba(0, 74, 119, 0.6)";
-              }}
-              onMouseOut={(e) => {
-                e.currentTarget.style.transform = "translateY(0)";
-                e.currentTarget.style.boxShadow =
-                  "0 4px 15px rgba(0, 74, 119, 0.4)";
-              }}
-            >
-              <svg
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
-              </svg>
-              Call User
-            </button>
-          )}
-
-          {myStream && (
-            <button
-              onClick={sendStreams}
-              style={{
-                padding: "12px 28px",
-                background: "linear-gradient(135deg, #00a86b 0%, #00c97d 100%)",
-                border: "none",
-                borderRadius: "10px",
-                color: "white",
-                fontSize: "15px",
-                fontWeight: "600",
-                cursor: "pointer",
-                transition: "all 0.3s ease",
-                boxShadow: "0 4px 15px rgba(0, 168, 107, 0.4)",
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-              }}
-              onMouseOver={(e) => {
-                e.currentTarget.style.transform = "translateY(-2px)";
-                e.currentTarget.style.boxShadow =
-                  "0 6px 20px rgba(0, 168, 107, 0.6)";
-              }}
-              onMouseOut={(e) => {
-                e.currentTarget.style.transform = "translateY(0)";
-                e.currentTarget.style.boxShadow =
-                  "0 4px 15px rgba(0, 168, 107, 0.4)";
-              }}
-            >
-              <svg
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <polygon points="23 7 16 12 23 17 23 7"></polygon>
-                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-              </svg>
-              Send Stream
-            </button>
-          )}
-        </div>
+    <div style={styles.container}>
+      <div style={styles.header}>
+        <span style={styles.roomStatus}>
+          {remoteStream
+            ? "● Live Connection"
+            : socketId
+              ? "User Online"
+              : "Waiting for Peer..."}
+        </span>
       </div>
 
-      {/* Video Grid */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: remoteStream
-            ? "repeat(auto-fit, minmax(400px, 1fr))"
-            : "1fr",
-          gap: "24px",
-          maxWidth: "1400px",
-          margin: "0 auto",
-        }}
-      >
-        {/* My Stream */}
-        {myStream && (
-          <div
-            style={{
-              background: "rgba(60, 60, 60, 0.6)",
-              borderRadius: "20px",
-              overflow: "hidden",
-              border: "2px solid rgba(0, 74, 119, 0.4)",
-              boxShadow: "0 8px 32px rgba(0, 0, 0, 0.3)",
-              transition: "all 0.3s ease",
-              position: "relative",
-            }}
-          >
-            <div
-              style={{
-                position: "absolute",
-                top: "16px",
-                left: "16px",
-                zIndex: 10,
-                background: "rgba(0, 74, 119, 0.9)",
-                padding: "8px 16px",
-                borderRadius: "8px",
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                backdropFilter: "blur(10px)",
-              }}
-            >
-              <div
-                style={{
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  background: "#00ff88",
-                  boxShadow: "0 0 10px #00ff88",
-                  animation: "pulse 2s ease-in-out infinite",
-                }}
-              ></div>
-              <span
-                style={{
-                  fontSize: "14px",
-                  fontWeight: "600",
-                  color: "white",
-                }}
-              >
-                You
-              </span>
-            </div>
+      <div style={styles.videoGrid}>
+        {remoteStream ? (
+          <video
+            ref={remoteVideoRef}
+            autoPlay
+            playsInline
+            style={styles.remoteVideo}
+          />
+        ) : (
+          <div style={styles.placeholder}>
+            <h2>
+              {socketId ? "Ready to Connect" : "Waiting for someone to join..."}
+            </h2>
+          </div>
+        )}
 
+        {myStream && (
+          <div style={styles.myVideoWrapper}>
             <video
               ref={myVideoRef}
               autoPlay
               playsInline
               muted
-              style={{
-                width: "100%",
-                height: "auto",
-                display: "block",
-                aspectRatio: "16/9",
-                objectFit: "cover",
-              }}
+              style={styles.myVideo}
             />
-
-            <div
-              style={{
-                padding: "16px",
-                background:
-                  "linear-gradient(to top, rgba(0, 0, 0, 0.7), transparent)",
-                position: "absolute",
-                bottom: 0,
-                left: 0,
-                right: 0,
-                display: "flex",
-                justifyContent: "center",
-                gap: "12px",
-              }}
-            >
-              <button
-                style={{
-                  padding: "12px",
-                  background: "rgba(255, 255, 255, 0.2)",
-                  border: "none",
-                  borderRadius: "50%",
-                  width: "44px",
-                  height: "44px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: "pointer",
-                  transition: "all 0.2s ease",
-                  backdropFilter: "blur(10px)",
-                }}
-                onMouseOver={(e) =>
-                  (e.currentTarget.style.background =
-                    "rgba(255, 255, 255, 0.3)")
-                }
-                onMouseOut={(e) =>
-                  (e.currentTarget.style.background =
-                    "rgba(255, 255, 255, 0.2)")
-                }
-              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
-                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
-                  <line x1="12" y1="19" x2="12" y2="23"></line>
-                  <line x1="8" y1="23" x2="16" y2="23"></line>
-                </svg>
-              </button>
-
-              <button
-                style={{
-                  padding: "12px",
-                  background: "rgba(255, 255, 255, 0.2)",
-                  border: "none",
-                  borderRadius: "50%",
-                  width: "44px",
-                  height: "44px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  cursor: "pointer",
-                  transition: "all 0.2s ease",
-                  backdropFilter: "blur(10px)",
-                }}
-                onMouseOver={(e) =>
-                  (e.currentTarget.style.background =
-                    "rgba(255, 255, 255, 0.3)")
-                }
-                onMouseOut={(e) =>
-                  (e.currentTarget.style.background =
-                    "rgba(255, 255, 255, 0.2)")
-                }
-              >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
-                  <polygon points="23 7 16 12 23 17 23 7"></polygon>
-                  <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-                </svg>
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Remote Stream */}
-        {remoteStream && (
-          <div
-            style={{
-              background: "rgba(60, 60, 60, 0.6)",
-              borderRadius: "20px",
-              overflow: "hidden",
-              border: "2px solid rgba(0, 74, 119, 0.6)",
-              boxShadow: "0 8px 32px rgba(0, 74, 119, 0.4)",
-              transition: "all 0.3s ease",
-              position: "relative",
-            }}
-          >
-            <div
-              style={{
-                position: "absolute",
-                top: "16px",
-                left: "16px",
-                zIndex: 10,
-                background: "rgba(0, 74, 119, 0.9)",
-                padding: "8px 16px",
-                borderRadius: "8px",
-                display: "flex",
-                alignItems: "center",
-                gap: "8px",
-                backdropFilter: "blur(10px)",
-              }}
-            >
-              <div
-                style={{
-                  width: "8px",
-                  height: "8px",
-                  borderRadius: "50%",
-                  background: "#00ff88",
-                  boxShadow: "0 0 10px #00ff88",
-                  animation: "pulse 2s ease-in-out infinite",
-                }}
-              ></div>
-              <span
-                style={{
-                  fontSize: "14px",
-                  fontWeight: "600",
-                  color: "white",
-                }}
-              >
-                Remote User
-              </span>
-            </div>
-
-            <video
-              ref={remoteVideoRef}
-              autoPlay
-              playsInline
-              style={{
-                width: "100%",
-                height: "auto",
-                display: "block",
-                aspectRatio: "16/9",
-                objectFit: "cover",
-              }}
-            />
+            <div style={styles.label}>You</div>
           </div>
         )}
       </div>
 
-      {/* Connection Status */}
-      {!myStream && !remoteStream && (
-        <div
-          style={{
-            maxWidth: "500px",
-            margin: "60px auto",
-            textAlign: "center",
-            padding: "40px",
-            background: "rgba(0, 74, 119, 0.1)",
-            borderRadius: "20px",
-            border: "2px dashed rgba(0, 74, 119, 0.3)",
-          }}
-        >
-          <svg
-            width="80"
-            height="80"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="#004a77"
-            strokeWidth="1.5"
-            style={{ margin: "0 auto 20px" }}
-          >
-            <polygon points="23 7 16 12 23 17 23 7"></polygon>
-            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-          </svg>
-          <h2 style={{ color: "#ffffff", marginBottom: "12px" }}>
-            Ready to Connect
-          </h2>
-          <p style={{ color: "rgba(255, 255, 255, 0.6)", fontSize: "15px" }}>
-            Start a call to begin your video conversation
-          </p>
+      <div style={styles.controls}>
+        {!remoteStream && socketId && (
+          <button onClick={handleCallUser} style={styles.btnPrimary}>
+            Start Call
+          </button>
+        )}
+        <div style={styles.iconGroup}>
+          <button style={styles.roundBtn}>🎤</button>
+          <button style={styles.roundBtn}>📷</button>
+          <button style={{ ...styles.roundBtn, backgroundColor: "#ff4d4d" }}>
+            📞
+          </button>
         </div>
-      )}
-
-      <style>{`
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.5; }
-    }
-  `}</style>
+      </div>
     </div>
   );
 }
+
+const styles = {
+  container: {
+    height: "100vh",
+    width: "100vw",
+    backgroundColor: "#3c3c3c",
+    display: "flex",
+    flexDirection: "column",
+    position: "relative",
+    color: "white",
+    fontFamily: "'Inter', sans-serif",
+    overflow: "hidden",
+  },
+  header: { padding: "20px", position: "absolute", top: 0, zIndex: 10 },
+  roomStatus: {
+    background: "rgba(0,0,0,0.6)",
+    padding: "8px 16px",
+    borderRadius: "20px",
+    fontSize: "0.85rem",
+    border: "1px solid #555",
+  },
+  videoGrid: {
+    flex: 1,
+    position: "relative",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: "#222",
+  },
+  remoteVideo: { width: "100%", height: "100%", objectFit: "cover" },
+  placeholder: { textAlign: "center", color: "#888" },
+  myVideoWrapper: {
+    position: "absolute",
+    bottom: "100px",
+    right: "30px",
+    width: "240px",
+    height: "150px",
+    borderRadius: "12px",
+    overflow: "hidden",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+    border: "2px solid #004a77",
+    backgroundColor: "#000",
+  },
+  myVideo: { width: "100%", height: "100%", objectFit: "cover" },
+  label: {
+    position: "absolute",
+    bottom: "5px",
+    left: "10px",
+    fontSize: "11px",
+    background: "rgba(0,0,0,0.5)",
+    padding: "2px 8px",
+    borderRadius: "4px",
+  },
+  controls: {
+    height: "90px",
+    backgroundColor: "rgba(30, 30, 30, 0.9)",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: "20px",
+    zIndex: 100,
+  },
+  btnPrimary: {
+    backgroundColor: "#004a77",
+    color: "white",
+    border: "none",
+    padding: "12px 28px",
+    borderRadius: "30px",
+    fontWeight: "600",
+    cursor: "pointer",
+    transition: "all 0.2s ease",
+  },
+  iconGroup: { display: "flex", gap: "15px" },
+  roundBtn: {
+    width: "50px",
+    height: "50px",
+    borderRadius: "50%",
+    border: "none",
+    backgroundColor: "#4a4a4a",
+    color: "white",
+    cursor: "pointer",
+    fontSize: "1.2rem",
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+};
